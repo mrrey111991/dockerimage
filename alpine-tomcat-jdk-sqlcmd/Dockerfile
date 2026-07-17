@@ -19,28 +19,30 @@ ENV CATALINA_HOME=/usr/local/tomcat
 ENV PATH="$CATALINA_HOME/bin:$PATH"
 
 # Install runtime dependencies
-RUN apk add --no-cache \
-    bash \
-    curl \
-    tar \
-    ca-certificates \
-    libc6-compat \
-    file \
-    zlib \
-    gnupg \
-    libtasn1 \
-    libpng \
-    && update-ca-certificates \
-    && rm -rf /var/cache/apk/*
+RUN apk update && \
+    apk upgrade --no-cache && \
+    apk add --no-cache \
+        bash \
+        curl \
+        tar \
+        ca-certificates \
+        libc6-compat \
+        file \
+        zlib \
+        gnupg \
+        libtasn1 \
+        libpng && \
+    update-ca-certificates && \
+    rm -rf /var/cache/apk/*
 
 # Copy sqlcmd from build stage
 COPY --from=build /go/bin/sqlcmd /usr/local/bin/sqlcmd
 
 # Download and extract Tomcat
-ARG TOMCAT_VERSION=10.1.50
+ARG TOMCAT_VERSION=11.0.24
 RUN mkdir -p "$CATALINA_HOME" \
     && base="apache-tomcat-${TOMCAT_VERSION}" \
-    && urls="https://downloads.apache.org/tomcat/tomcat-10/v${TOMCAT_VERSION}/bin/${base}.tar.gz https://archive.apache.org/dist/tomcat/tomcat-10/v${TOMCAT_VERSION}/bin/${base}.tar.gz" \
+    && urls="https://downloads.apache.org/tomcat/tomcat-11/v${TOMCAT_VERSION}/bin/${base}.tar.gz https://archive.apache.org/dist/tomcat/tomcat-11/v${TOMCAT_VERSION}/bin/${base}.tar.gz" \
     && for url in $urls; do \
         echo "Downloading: $url"; \
         if curl -fL --retry 5 --retry-delay 2 -o /tmp/tomcat.tgz "$url"; then break; fi; \
@@ -48,7 +50,8 @@ RUN mkdir -p "$CATALINA_HOME" \
     && [ -s /tmp/tomcat.tgz ] \
     && tar -xzf /tmp/tomcat.tgz -C "$CATALINA_HOME" --strip-components=1 \
     && rm /tmp/tomcat.tgz \
-    && chmod +x "$CATALINA_HOME"/bin/*.sh
+    && chmod +x "$CATALINA_HOME"/bin/*.sh \
+    && rm -rf /var/cache/apk/*
 
 # Expose Tomcat default port
 EXPOSE 8080

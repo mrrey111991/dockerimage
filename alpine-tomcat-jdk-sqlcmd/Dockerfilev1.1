@@ -1,0 +1,85 @@
+# ---- builder: build sqlcmd with patched Go + x/crypto (CVE fixes) ----
+FROM golang:1.24.9-alpine AS build
+# Ensure we use exactly the toolchain in this image (no auto-download of another Go)
+ENV GOTOOLCHAIN=local
+
+RUN apk add --no-cache git bash file
+WORKDIR /src
+
+# Clone repo (HEAD), or pin a tag by uncommenting the checkout line
+RUN git clone https://github.com/microsoft/go-sqlcmd.git .
+# RUN git checkout v1.8.2
+
+# Pin deps for CVEs and stabilize genproto to avoid “ambiguous import”
+RUN go env -w GOPROXY=https://proxy.golang.org,direct \
+ && go mod edit \
+      -require=golang.org/x/crypto@v0.35.0 \
+      -replace=google.golang.org/genproto=google.golang.org/genproto@v0.0.0-20240701130421-f6361c86f094 \
+      -replace=google.golang.org/genproto/googleapis/api=google.golang.org/genproto/googleapis/api@v0.0.0-20240701130421-f6361c86f094 \
+      -replace=google.golang.org/genproto/googleapis/rpc=google.golang.org/genproto/googleapis/rpc@v0.0.0-20240701130421-f6361c86f094 \
+ && go mod tidy
+
+# (Optional) prove we’re on a patched Go at build time
+RUN go version && go env GOTOOLCHAIN
+
+# Auto-discover the correct main package (prefer cmd/modern, else cmd/sqlcmd)
+RUN set -eux; \
+  # list all main packages with path
+  go list -f '{{if eq .Name "main"}}{{.ImportPath}}{{end}}' ./... | tee /tmp/mainpkgs.txt; \
+  # prefer modern, else sqlcmd
+  MAINPKG="$(grep -E 'cmd/modern' /tmp/mainpkgs.txt || true)"; \
+  if [ -z "$MAINPKG" ]; then MAINPKG="$(grep -E 'cmd/sqlcmd($|/)' /tmp/mainpkgs.txt || true)"; fi; \
+  if [ -z "$MAINPKG" ]; then echo "No sqlcmd main package found."; cat /tmp/mainpkgs.txt; exit 1; fi; \
+  echo "Building: ${MAINPKG}"; \
+  mkdir -p /out; \
+  CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+    go build -trimpath -ldflags "-s -w" -o /out/sqlcmd "${MAINPKG}"; \
+  ls -l /out/sqlcmd; \
+  file /out/sqlcmd; \
+  test -x /out/sqlcmd; \
+  /out/sqlcmd --help >/dev/null || true
+
+# ---- runtime: Tomcat (Alpine) + sqlcmd ----
+FROM eclipse-temurin:21-jdk-alpine
+
+ARG TOMCAT_VERSION=10.1.50
+ENV CATALINA_HOME=/usr/local/tomcat
+ENV PATH=/usr/local/tomcat/bin:/usr/local/bin:$PATH
+ENV HOME=/root
+
+# Minimal tools + `file` for on-container verification
+RUN apk add --no-cache curl bash tar ca-certificates libc6-compat file \
+ && update-ca-certificates
+
+# Robust Tomcat download (primary + archive fallback; retries)
+RUN set -eux; \
+    mkdir -p "$CATALINA_HOME"; \
+    base="apache-tomcat-${TOMCAT_VERSION}"; \
+    url1="https://downloads.apache.org/tomcat/tomcat-10/v${TOMCAT_VERSION}/bin/${base}.tar.gz"; \
+    url2="https://archive.apache.org/dist/tomcat/tomcat-10/v${TOMCAT_VERSION}/bin/${base}.tar.gz"; \
+    for u in "$url1" "$url2"; do \
+      echo "Downloading: $u"; \
+      if curl -fL --connect-timeout 15 --retry 5 --retry-delay 2 --retry-connrefused -o /tmp/tomcat.tgz "$u"; then break; fi; \
+    done; \
+    [ -s /tmp/tomcat.tgz ]; \
+    tar -xzf /tmp/tomcat.tgz -C "$CATALINA_HOME" --strip-components=1; \
+    rm /tmp/tomcat.tgz; \
+    chmod +x "$CATALINA_HOME"/bin/*.sh
+
+# Install sqlcmd and set perms
+COPY --from=build /out/sqlcmd /usr/local/bin/sqlcmd
+RUN chmod 0755 /usr/local/bin/sqlcmd
+
+# Non-root tomcat user
+RUN addgroup -S tomcat && adduser -S tomcat -G tomcat \
+ && chown -R tomcat:tomcat "$CATALINA_HOME"
+USER tomcat
+
+WORKDIR $CATALINA_HOME
+EXPOSE 8080
+
+# Healthcheck: ensure sqlcmd is runnable
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
+  CMD /bin/sh -lc 'command -v sqlcmd >/dev/null && sqlcmd --version >/dev/null 2>&1 || exit 1'
+
+CMD ["/usr/local/tomcat/bin/catalina.sh", "run"]

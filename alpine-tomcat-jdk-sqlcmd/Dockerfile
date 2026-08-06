@@ -1,15 +1,17 @@
 # ===== Stage 0: Build sqlcmd =====
-FROM golang:1.25.5-alpine3.22 AS build
+FROM golang:1.26-alpine3.22 AS build
 
 # Install dependencies for building sqlcmd
 RUN apk add --no-cache git bash file zlib gnupg libtasn1 libpng libc6-compat curl
 
 WORKDIR /src
 
-# Clone and build sqlcmd
-RUN git clone https://github.com/microsoft/go-sqlcmd.git . \
-    && go build -o /go/bin/sqlcmd ./cmd/sqlcmd
-
+RUN curl -L \
+    https://github.com/microsoft/go-sqlcmd/releases/latest/download/sqlcmd-linux-amd64.tar.bz2 \
+    -o /tmp/sqlcmd.tar.bz2 \
+ && mkdir -p /out \
+ && tar -xjf /tmp/sqlcmd.tar.bz2 -C /out \
+ && chmod +x /out/sqlcmd
 
 # ===== Stage 1: Runtime image with Tomcat + sqlcmd =====
 FROM eclipse-temurin:21-jdk-alpine
@@ -36,7 +38,10 @@ RUN apk update && \
     rm -rf /var/cache/apk/*
 
 # Copy sqlcmd from build stage
-COPY --from=build /go/bin/sqlcmd /usr/local/bin/sqlcmd
+COPY --from=build /out/sqlcmd /usr/local/bin/sqlcmd
+
+RUN chmod 755 /usr/local/bin/sqlcmd \
+ && sqlcmd --version
 
 # Download and extract Tomcat
 ARG TOMCAT_VERSION=11.0.24

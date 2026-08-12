@@ -1,0 +1,280 @@
+# ==============================================================================
+# Stage 0: Build sqlcmd
+# ==============================================================================
+
+FROM golang:1.26-alpine3.24 AS sqlcmd-build
+
+ENV GOPROXY=https://proxy.golang.org,direct
+ENV GOSUMDB=sum.golang.org
+
+RUN set -eux; \
+    apk add --no-cache \
+        git \
+        ca-certificates
+
+WORKDIR /src
+
+# ------------------------------------------------------------------------------
+# Clone Microsoft go-sqlcmd
+# ------------------------------------------------------------------------------
+
+RUN git clone --depth 1 \
+    https://github.com/microsoft/go-sqlcmd.git .
+
+# ------------------------------------------------------------------------------
+# Download Go dependencies
+# ------------------------------------------------------------------------------
+
+RUN set -eux; \
+    go mod download
+
+# ------------------------------------------------------------------------------
+# Build sqlcmd
+# ------------------------------------------------------------------------------
+
+RUN set -eux; \
+    CGO_ENABLED=0 \
+    GOOS=linux \
+    GOARCH=amd64 \
+    go build \
+        -trimpath \
+        -ldflags="-s -w" \
+        -o /sqlcmd \
+        ./cmd/modern; \
+    \
+    chmod 0755 /sqlcmd; \
+    /sqlcmd --version
+
+
+# ==============================================================================
+# Stage 1: Download and Prepare Tomcat
+# ==============================================================================
+
+FROM alpine:3.24 AS tomcat-build
+
+ARG TOMCAT_VERSION=11.0.24
+ARG TOMCAT_BASE=apache-tomcat-${TOMCAT_VERSION}
+
+ARG TOMCAT_URL=https://downloads.apache.org/tomcat/tomcat-11/v${TOMCAT_VERSION}/bin/${TOMCAT_BASE}.tar.gz
+ARG TOMCAT_ARCHIVE=https://archive.apache.org/dist/tomcat/tomcat-11/v${TOMCAT_VERSION}/bin/${TOMCAT_BASE}.tar.gz
+
+# Optional SHA512 supplied during build
+ARG TOMCAT_SHA512=""
+
+# ------------------------------------------------------------------------------
+# Install temporary Tomcat build tools
+# ------------------------------------------------------------------------------
+
+RUN set -eux; \
+    apk add --no-cache \
+        ca-certificates \
+        curl \
+        tar \
+        gzip; \
+    update-ca-certificates
+
+# ------------------------------------------------------------------------------
+# Download and install Tomcat
+# ------------------------------------------------------------------------------
+
+RUN set -eux; \
+    mkdir -p /usr/local/tomcat; \
+    \
+    if curl -fsSL \
+        --retry 5 \
+        --retry-all-errors \
+        -o /tmp/tomcat.tar.gz \
+        "${TOMCAT_URL}"; then \
+        echo "Downloaded Tomcat from primary mirror"; \
+    else \
+        echo "Primary mirror failed; using Apache archive"; \
+        curl -fsSL \
+            --retry 5 \
+            --retry-all-errors \
+            -o /tmp/tomcat.tar.gz \
+            "${TOMCAT_ARCHIVE}"; \
+    fi; \
+    \
+    # --------------------------------------------------------------------------
+    # SHA512 verification
+    # --------------------------------------------------------------------------
+    if curl -fsSL \
+        --retry 5 \
+        --retry-all-errors \
+        -o /tmp/tomcat.sha512 \
+        "${TOMCAT_URL}.sha512"; then \
+        \
+        echo "Verifying Tomcat SHA512..."; \
+        \
+        awk '{print $1 "  /tmp/tomcat.tar.gz"}' \
+            /tmp/tomcat.sha512 \
+            > /tmp/check.sha512; \
+        \
+        sha512sum -c /tmp/check.sha512; \
+        \
+        rm -f \
+            /tmp/check.sha512 \
+            /tmp/tomcat.sha512; \
+    elif [ -n "${TOMCAT_SHA512}" ]; then \
+        \
+        echo "Verifying Tomcat using supplied SHA512..."; \
+        \
+        echo "${TOMCAT_SHA512}  /tmp/tomcat.tar.gz" \
+            > /tmp/check.sha512; \
+        \
+        sha512sum -c /tmp/check.sha512; \
+        \
+        rm -f /tmp/check.sha512; \
+    else \
+        echo "WARNING: Tomcat SHA512 verification skipped."; \
+    fi; \
+    \
+    # --------------------------------------------------------------------------
+    # Extract Tomcat
+    # --------------------------------------------------------------------------
+    tar -xzf /tmp/tomcat.tar.gz \
+        --strip-components=1 \
+        -C /usr/local/tomcat; \
+    \
+    rm -f /tmp/tomcat.tar.gz; \
+    \
+    # --------------------------------------------------------------------------
+    # Remove unnecessary/default applications
+    # --------------------------------------------------------------------------
+    rm -rf \
+        /usr/local/tomcat/webapps/docs \
+        /usr/local/tomcat/webapps/examples \
+        /usr/local/tomcat/webapps/ROOT; \
+    \
+    chmod +x /usr/local/tomcat/bin/*.sh
+
+
+# ==============================================================================
+# Stage 2: Final Runtime
+# ==============================================================================
+#
+# Use Alpine 3.24 directly instead of:
+#
+#   eclipse-temurin:21-jdk-alpine-3.23
+#
+# This prevents the older Alpine 3.23 package set from being carried
+# into the final image.
+#
+# ==============================================================================
+
+FROM alpine:3.24
+
+# ==============================================================================
+# Environment
+# ==============================================================================
+
+ENV JAVA_HOME=/usr/lib/jvm/java-21-openjdk
+ENV CATALINA_HOME=/usr/local/tomcat
+ENV PATH="${JAVA_HOME}/bin:${CATALINA_HOME}/bin:/usr/local/bin:${PATH}"
+
+# ==============================================================================
+# Install Java 21 Runtime
+# ==============================================================================
+
+RUN set -eux; \
+    apk add --no-cache \
+        openjdk21-jre-headless \
+        ca-certificates; \
+    update-ca-certificates; \
+    rm -rf /var/cache/apk/*
+
+# ==============================================================================
+# Create Tomcat User
+# ==============================================================================
+
+RUN set -eux; \
+    addgroup -S tomcat; \
+    adduser \
+        -S \
+        -D \
+        -H \
+        -h "${CATALINA_HOME}" \
+        -s /sbin/nologin \
+        -G tomcat \
+        tomcat
+
+# ==============================================================================
+# Install sqlcmd
+# ==============================================================================
+
+COPY --from=sqlcmd-build \
+    /sqlcmd \
+    /usr/local/bin/sqlcmd
+
+RUN set -eux; \
+    chmod 0755 /usr/local/bin/sqlcmd
+
+# ==============================================================================
+# Install Tomcat
+# ==============================================================================
+
+COPY --from=tomcat-build \
+    /usr/local/tomcat \
+    ${CATALINA_HOME}
+
+# ==============================================================================
+# Set Permissions
+# ==============================================================================
+
+RUN set -eux; \
+    chown -R tomcat:tomcat "${CATALINA_HOME}"; \
+    chmod +x "${CATALINA_HOME}"/bin/*.sh
+
+# ==============================================================================
+# Security Cleanup
+# ==============================================================================
+
+RUN set -eux; \
+    rm -rf \
+        /tmp/* \
+        /var/tmp/* \
+        /root/.cache \
+        /root/.npm \
+        /root/.m2
+
+# ==============================================================================
+# Verification
+# ==============================================================================
+
+RUN set -eux; \
+    echo "========================================"; \
+    echo "Java Version"; \
+    echo "========================================"; \
+    java -version; \
+    \
+    echo "========================================"; \
+    echo "JAVA_HOME"; \
+    echo "========================================"; \
+    echo "${JAVA_HOME}"; \
+    \
+    echo "========================================"; \
+    echo "sqlcmd Version"; \
+    echo "========================================"; \
+    sqlcmd --version; \
+    \
+    echo "========================================"; \
+    echo "Tomcat Version"; \
+    echo "========================================"; \
+    "${CATALINA_HOME}/bin/catalina.sh" version; \
+    \
+    echo "========================================"; \
+    echo "Alpine Version"; \
+    echo "========================================"; \
+    cat /etc/alpine-release
+
+# ==============================================================================
+# Runtime
+# ==============================================================================
+
+EXPOSE 8080
+
+USER tomcat
+
+WORKDIR ${CATALINA_HOME}
+
+CMD ["catalina.sh", "run"]

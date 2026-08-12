@@ -1,60 +1,117 @@
-# ===== Stage 0: Build sqlcmd =====
-FROM golang:1.25.5-alpine3.22 AS build
+# ==============================================================================
+# Base Image
+# ==============================================================================
 
-# Install dependencies for building sqlcmd
-RUN apk add --no-cache git bash file zlib gnupg libtasn1 libpng libc6-compat curl
+FROM eclipse-temurin:21-jdk-jammy
 
-WORKDIR /src
+LABEL maintainer="Remy Manalo"
 
-# Clone and build sqlcmd
-RUN git clone https://github.com/microsoft/go-sqlcmd.git . \
-    && go build -o /go/bin/sqlcmd ./cmd/sqlcmd
+ENV DEBIAN_FRONTEND=noninteractive
+ENV ACCEPT_EULA=Y
 
-
-# ===== Stage 1: Runtime image with Tomcat + sqlcmd =====
-FROM eclipse-temurin:21-jdk-alpine
-
-# Environment variables
 ENV CATALINA_HOME=/usr/local/tomcat
-ENV PATH="$CATALINA_HOME/bin:$PATH"
+ENV PATH="${CATALINA_HOME}/bin:/opt/mssql-tools18/bin:${PATH}"
 
-# Install runtime dependencies
-RUN apk update && \
-    apk upgrade --no-cache && \
-    apk add --no-cache \
-        bash \
-        curl \
-        tar \
-        ca-certificates \
-        libc6-compat \
-        file \
-        zlib \
-        gnupg \
-        libtasn1 \
-        libpng && \
-    update-ca-certificates && \
-    rm -rf /var/cache/apk/*
+# ==============================================================================
+# Arguments
+# ==============================================================================
 
-# Copy sqlcmd from build stage
-COPY --from=build /go/bin/sqlcmd /usr/local/bin/sqlcmd
-
-# Download and extract Tomcat
 ARG TOMCAT_VERSION=11.0.24
-RUN mkdir -p "$CATALINA_HOME" \
-    && base="apache-tomcat-${TOMCAT_VERSION}" \
-    && urls="https://downloads.apache.org/tomcat/tomcat-11/v${TOMCAT_VERSION}/bin/${base}.tar.gz https://archive.apache.org/dist/tomcat/tomcat-11/v${TOMCAT_VERSION}/bin/${base}.tar.gz" \
-    && for url in $urls; do \
-        echo "Downloading: $url"; \
-        if curl -fL --retry 5 --retry-delay 2 -o /tmp/tomcat.tgz "$url"; then break; fi; \
-    done \
-    && [ -s /tmp/tomcat.tgz ] \
-    && tar -xzf /tmp/tomcat.tgz -C "$CATALINA_HOME" --strip-components=1 \
-    && rm /tmp/tomcat.tgz \
-    && chmod +x "$CATALINA_HOME"/bin/*.sh \
-    && rm -rf /var/cache/apk/*
+ARG TOMCAT_BASE=apache-tomcat-${TOMCAT_VERSION}
+ARG TOMCAT_URL=https://downloads.apache.org/tomcat/tomcat-11/v${TOMCAT_VERSION}/bin/${TOMCAT_BASE}.tar.gz
+ARG TOMCAT_ARCHIVE=https://archive.apache.org/dist/tomcat/tomcat-11/v${TOMCAT_VERSION}/bin/${TOMCAT_BASE}.tar.gz
+ARG TOMCAT_SHA512=""
 
-# Expose Tomcat default port
+# ==============================================================================
+# Install OS Packages
+# ==============================================================================
+
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        gnupg2 \
+        apt-transport-https \
+        unixodbc \
+        tar; \
+    rm -rf /var/lib/apt/lists/*
+
+# ==============================================================================
+# Install Microsoft sqlcmd (Official Microsoft Repository)
+# ==============================================================================
+
+RUN set -eux; \
+    mkdir -p /etc/apt/keyrings; \
+    curl -fsSL https://packages.microsoft.com/keys/microsoft.asc \
+        | gpg --dearmor \
+        -o /etc/apt/keyrings/microsoft.gpg; \
+    chmod 644 /etc/apt/keyrings/microsoft.gpg; \
+    echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/microsoft.gpg] https://packages.microsoft.com/ubuntu/22.04/prod jammy main" \
+        > /etc/apt/sources.list.d/microsoft-prod.list; \
+    apt-get update; \
+    ACCEPT_EULA=Y apt-get install -y --no-install-recommends \
+        mssql-tools18; \
+    ln -sf /opt/mssql-tools18/bin/sqlcmd /usr/local/bin/sqlcmd; \
+    sqlcmd -?; \
+    apt-get clean; \
+    rm -rf /var/lib/apt/lists/*
+
+# ==============================================================================
+# Create Tomcat User
+# ==============================================================================
+
+RUN groupadd --system tomcat && \
+    useradd \
+        --system \
+        --gid tomcat \
+        --home-dir ${CATALINA_HOME} \
+        --shell /usr/sbin/nologin \
+        tomcat
+
+# ==============================================================================
+# Install Apache Tomcat
+# ==============================================================================
+
+RUN set -eux; \
+    mkdir -p "${CATALINA_HOME}"; \
+    if curl -fsSL --retry 5 -o /tmp/tomcat.tar.gz "${TOMCAT_URL}"; then \
+        echo "Downloaded Tomcat"; \
+    else \
+        curl -fsSL --retry 5 -o /tmp/tomcat.tar.gz "${TOMCAT_ARCHIVE}"; \
+    fi; \
+    if curl -fsSL -o /tmp/tomcat.sha512 "${TOMCAT_URL}.sha512"; then \
+        awk '{print $1 "  /tmp/tomcat.tar.gz"}' /tmp/tomcat.sha512 > /tmp/check.sha512; \
+        sha512sum -c /tmp/check.sha512; \
+        rm -f /tmp/check.sha512 /tmp/tomcat.sha512; \
+    elif [ -n "${TOMCAT_SHA512}" ]; then \
+        echo "${TOMCAT_SHA512}  /tmp/tomcat.tar.gz" > /tmp/check.sha512; \
+        sha512sum -c /tmp/check.sha512; \
+        rm -f /tmp/check.sha512; \
+    else \
+        echo "WARNING: Tomcat SHA512 verification skipped."; \
+    fi; \
+    tar -xzf /tmp/tomcat.tar.gz \
+        --strip-components=1 \
+        -C "${CATALINA_HOME}"; \
+    rm -f /tmp/tomcat.tar.gz; \
+    chmod +x ${CATALINA_HOME}/bin/*.sh; \
+    chown -R tomcat:tomcat ${CATALINA_HOME}
+
+# ==============================================================================
+# Verify Installation
+# ==============================================================================
+
+RUN sqlcmd -? || true
+
+# ==============================================================================
+# Runtime
+# ==============================================================================
+
 EXPOSE 8080
 
-# Default command
+USER tomcat
+
+WORKDIR ${CATALINA_HOME}
+
 CMD ["catalina.sh", "run"]

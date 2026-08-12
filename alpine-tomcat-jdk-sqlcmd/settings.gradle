@@ -1,2 +1,3 @@
 rootProject.name = 'dockerimage'
 
+// docker build --no-cache -t mrrey21/alpine-tomcat-jdk21-sqlcmd .

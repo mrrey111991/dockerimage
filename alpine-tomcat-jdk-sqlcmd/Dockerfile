@@ -1,117 +1,201 @@
-# ==============================================================================
-# Base Image
-# ==============================================================================
+# ============================================================
+# Stage 1: Build SQLCMD
+# ============================================================
 
-FROM eclipse-temurin:21-jdk-jammy
+FROM golang:1.26.5-alpine AS sqlcmd-builder
 
-LABEL maintainer="Remy Manalo"
+WORKDIR /build
 
-ENV DEBIAN_FRONTEND=noninteractive
-ENV ACCEPT_EULA=Y
+# ============================================================
+# Build dependencies
+# ============================================================
 
-ENV CATALINA_HOME=/usr/local/tomcat
-ENV PATH="${CATALINA_HOME}/bin:/opt/mssql-tools18/bin:${PATH}"
+RUN set -eux; \
+    apk add --no-cache \
+        git \
+        ca-certificates
 
-# ==============================================================================
-# Arguments
-# ==============================================================================
+# ============================================================
+# Download CURRENT SQLCMD source
+#
+# We intentionally use the current source instead of the
+# v1.10.0 tag because v1.10.0 contains the old:
+#
+#   github.com/docker/docker 28.5.2+incompatible
+#
+# Current SQLCMD has migrated to Moby modules.
+# ============================================================
+
+RUN set -eux; \
+    git clone --depth 1 \
+        "https://github.com/microsoft/go-sqlcmd.git" \
+        /build/go-sqlcmd
+
+WORKDIR /build/go-sqlcmd
+
+# ============================================================
+# Upgrade Go security dependencies
+# ============================================================
+
+RUN set -eux; \
+    go mod edit \
+        -require=golang.org/x/crypto@v0.54.0 \
+        -require=golang.org/x/net@v0.57.0; \
+    go mod tidy; \
+    go mod download
+
+# ============================================================
+# Verify vulnerable Docker dependency is NOT present
+# ============================================================
+
+RUN set -eux; \
+    echo "Checking Go dependencies..."; \
+    if go list -m all | grep -q '^github.com/docker/docker '; then \
+        echo "ERROR: github.com/docker/docker dependency detected"; \
+        go list -m all | grep '^github.com/docker/docker '; \
+        exit 1; \
+    fi; \
+    echo "OK: github.com/docker/docker is NOT present"
+
+# ============================================================
+# Display security-related dependency versions
+# ============================================================
+
+RUN set -eux; \
+    echo "========================================"; \
+    echo "Go crypto:"; \
+    go list -m golang.org/x/crypto; \
+    echo "Go network:"; \
+    go list -m golang.org/x/net; \
+    echo "========================================"
+
+# ============================================================
+# Build SQLCMD
+# ============================================================
+
+RUN set -eux; \
+    CGO_ENABLED=0 \
+    GOOS=linux \
+    GOARCH=amd64 \
+    go build \
+        -trimpath \
+        -ldflags="-s -w" \
+        -o /sqlcmd \
+        ./cmd/modern
+
+# ============================================================
+# Verify SQLCMD
+# ============================================================
+
+RUN set -eux; \
+    /sqlcmd --version
+
+
+# ============================================================
+# Stage 2: Runtime Image
+# ============================================================
+
+FROM alpine:3.24
 
 ARG TOMCAT_VERSION=11.0.24
-ARG TOMCAT_BASE=apache-tomcat-${TOMCAT_VERSION}
-ARG TOMCAT_URL=https://downloads.apache.org/tomcat/tomcat-11/v${TOMCAT_VERSION}/bin/${TOMCAT_BASE}.tar.gz
-ARG TOMCAT_ARCHIVE=https://archive.apache.org/dist/tomcat/tomcat-11/v${TOMCAT_VERSION}/bin/${TOMCAT_BASE}.tar.gz
-ARG TOMCAT_SHA512=""
 
-# ==============================================================================
-# Install OS Packages
-# ==============================================================================
+# ============================================================
+# Environment
+# ============================================================
+
+ENV JAVA_HOME=/usr/lib/jvm/java-21-openjdk \
+    CATALINA_HOME=/usr/local/tomcat \
+    CATALINA_BASE=/usr/local/tomcat \
+    PATH=/usr/local/tomcat/bin:/usr/local/bin:$PATH \
+    LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8
+
+# ============================================================
+# Runtime dependencies
+#
+# curl  = HTTP requests / downloads
+# unzip = ZIP extraction
+# ============================================================
 
 RUN set -eux; \
-    apt-get update; \
-    apt-get install -y --no-install-recommends \
+    apk update; \
+    apk upgrade; \
+    apk add --no-cache \
+        openjdk21-jre-headless \
         ca-certificates \
+        bash \
+        tzdata \
+        openssl \
         curl \
-        gnupg2 \
-        apt-transport-https \
-        unixodbc \
-        tar; \
-    rm -rf /var/lib/apt/lists/*
+        unzip; \
+    update-ca-certificates; \
+    java -version; \
+    curl --version; \
+    unzip -v | head -n 3
 
-# ==============================================================================
-# Install Microsoft sqlcmd (Official Microsoft Repository)
-# ==============================================================================
-
-RUN set -eux; \
-    mkdir -p /etc/apt/keyrings; \
-    curl -fsSL https://packages.microsoft.com/keys/microsoft.asc \
-        | gpg --dearmor \
-        -o /etc/apt/keyrings/microsoft.gpg; \
-    chmod 644 /etc/apt/keyrings/microsoft.gpg; \
-    echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/microsoft.gpg] https://packages.microsoft.com/ubuntu/22.04/prod jammy main" \
-        > /etc/apt/sources.list.d/microsoft-prod.list; \
-    apt-get update; \
-    ACCEPT_EULA=Y apt-get install -y --no-install-recommends \
-        mssql-tools18; \
-    ln -sf /opt/mssql-tools18/bin/sqlcmd /usr/local/bin/sqlcmd; \
-    sqlcmd -?; \
-    apt-get clean; \
-    rm -rf /var/lib/apt/lists/*
-
-# ==============================================================================
-# Create Tomcat User
-# ==============================================================================
-
-RUN groupadd --system tomcat && \
-    useradd \
-        --system \
-        --gid tomcat \
-        --home-dir ${CATALINA_HOME} \
-        --shell /usr/sbin/nologin \
-        tomcat
-
-# ==============================================================================
-# Install Apache Tomcat
-# ==============================================================================
+# ============================================================
+# Install Apache Tomcat 11
+# ============================================================
 
 RUN set -eux; \
     mkdir -p "${CATALINA_HOME}"; \
-    if curl -fsSL --retry 5 -o /tmp/tomcat.tar.gz "${TOMCAT_URL}"; then \
-        echo "Downloaded Tomcat"; \
-    else \
-        curl -fsSL --retry 5 -o /tmp/tomcat.tar.gz "${TOMCAT_ARCHIVE}"; \
-    fi; \
-    if curl -fsSL -o /tmp/tomcat.sha512 "${TOMCAT_URL}.sha512"; then \
-        awk '{print $1 "  /tmp/tomcat.tar.gz"}' /tmp/tomcat.sha512 > /tmp/check.sha512; \
-        sha512sum -c /tmp/check.sha512; \
-        rm -f /tmp/check.sha512 /tmp/tomcat.sha512; \
-    elif [ -n "${TOMCAT_SHA512}" ]; then \
-        echo "${TOMCAT_SHA512}  /tmp/tomcat.tar.gz" > /tmp/check.sha512; \
-        sha512sum -c /tmp/check.sha512; \
-        rm -f /tmp/check.sha512; \
-    else \
-        echo "WARNING: Tomcat SHA512 verification skipped."; \
-    fi; \
+    curl -fsSL --retry 5 \
+        -o /tmp/tomcat.tar.gz \
+        "https://dlcdn.apache.org/tomcat/tomcat-11/v${TOMCAT_VERSION}/bin/apache-tomcat-${TOMCAT_VERSION}.tar.gz"; \
     tar -xzf /tmp/tomcat.tar.gz \
         --strip-components=1 \
         -C "${CATALINA_HOME}"; \
     rm -f /tmp/tomcat.tar.gz; \
-    chmod +x ${CATALINA_HOME}/bin/*.sh; \
-    chown -R tomcat:tomcat ${CATALINA_HOME}
+    rm -rf "${CATALINA_HOME}/webapps/"*; \
+    mkdir -p "${CATALINA_HOME}/webapps"; \
+    chmod +x "${CATALINA_HOME}/bin/"*.sh; \
+    "${CATALINA_HOME}/bin/catalina.sh" version
 
-# ==============================================================================
-# Verify Installation
-# ==============================================================================
+# ============================================================
+# Install SQLCMD
+# ============================================================
 
-RUN sqlcmd -? || true
+COPY --from=sqlcmd-builder \
+    /sqlcmd \
+    /usr/local/bin/sqlcmd
 
-# ==============================================================================
-# Runtime
-# ==============================================================================
+RUN set -eux; \
+    chmod 0755 /usr/local/bin/sqlcmd; \
+    /usr/local/bin/sqlcmd --version
+
+# ============================================================
+# Create Tomcat user
+# ============================================================
+
+RUN set -eux; \
+    addgroup -S tomcat; \
+    adduser -S -D -H \
+        -s /sbin/nologin \
+        -G tomcat \
+        tomcat; \
+    chown -R tomcat:tomcat "${CATALINA_HOME}"; \
+    chmod +x "${CATALINA_HOME}/bin/"*.sh
+
+# ============================================================
+# Working directory
+# ============================================================
+
+WORKDIR ${CATALINA_HOME}
+
+# ============================================================
+# Expose Tomcat
+# ============================================================
 
 EXPOSE 8080
 
+# ============================================================
+# Run as non-root
+# ============================================================
+
 USER tomcat
 
-WORKDIR ${CATALINA_HOME}
+# ============================================================
+# Start Tomcat
+# ============================================================
 
 CMD ["catalina.sh", "run"]
